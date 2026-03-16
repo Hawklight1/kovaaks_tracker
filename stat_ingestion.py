@@ -4,14 +4,10 @@ import csv
 import hashlib
 import json
 import os
-import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 from datetime import datetime
-
-from pymongo import MongoClient, UpdateOne
-from pymongo.collection import Collection
-from pymongo.database import Database
 
 
 # =========================
@@ -22,8 +18,7 @@ DEFAULT_KOVAAKS_ROOT = r"C:\Program Files (x86)\Steam\steamapps\common\FPSAimTra
 DEFAULT_STATS_DIR = rf"{DEFAULT_KOVAAKS_ROOT}\stats"
 DEFAULT_PLAYLISTS_DIR = rf"{DEFAULT_KOVAAKS_ROOT}\Saved\SaveGames\Playlists"
 
-DEFAULT_MONGO_URI = "mongodb://localhost:27017/"
-DEFAULT_DB_NAME = "kovaaks_tracker"
+DEFAULT_DB_PATH = "kovaaks_tracker.db"
 
 
 # =========================
@@ -99,13 +94,13 @@ def parse_filename_metadata(file_path: Path) -> dict[str, Any]:
 
     return result
 
+
 def parse_filename_timestamp(timestamp_str: str | None) -> str | None:
     if not timestamp_str:
         return None
 
     ts = timestamp_str.strip()
 
-    # Try several common formats Kovaak's filenames might use
     formats = [
         "%Y.%m.%d-%H.%M.%S",
         "%Y-%m-%d %H-%M-%S",
@@ -123,6 +118,113 @@ def parse_filename_timestamp(timestamp_str: str | None) -> str | None:
             continue
 
     return None
+
+
+# =========================
+# SQLite helpers
+# =========================
+
+def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        scenario_hash TEXT,
+        file_sha256 TEXT,
+        source_file TEXT,
+        source_path TEXT,
+        scenario_name TEXT,
+        challenge_name TEXT,
+        score REAL,
+        kills INTEGER,
+        deaths INTEGER,
+        fight_time REAL,
+        time_remaining REAL,
+        avg_ttk REAL,
+        damage_done REAL,
+        hit_count INTEGER,
+        miss_count INTEGER,
+        pause_count INTEGER,
+        pause_duration REAL,
+        avg_target_scale REAL,
+        avg_time_dilation REAL,
+        input_lag REAL,
+        max_fps_config REAL,
+        sens_scale TEXT,
+        challenge_start TEXT,
+        run_datetime TEXT,
+        file_timestamp_str TEXT,
+        game_version TEXT,
+        kill_count_parsed INTEGER,
+        raw_summary_json TEXT,
+        file_metadata_json TEXT
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS kill_events (
+        run_id TEXT NOT NULL,
+        kill_number INTEGER NOT NULL,
+        timestamp TEXT,
+        bot TEXT,
+        weapon TEXT,
+        ttk_seconds REAL,
+        shots INTEGER,
+        hits INTEGER,
+        accuracy REAL,
+        damage_done REAL,
+        damage_possible REAL,
+        efficiency REAL,
+        cheated INTEGER,
+        overshots INTEGER,
+        scenario_name TEXT,
+        source_file TEXT,
+        PRIMARY KEY (run_id, kill_number)
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS playlists (
+        playlist_id TEXT PRIMARY KEY,
+        playlist_name TEXT,
+        author_steam_id TEXT,
+        author_name TEXT,
+        description TEXT,
+        scenario_count INTEGER,
+        source_file TEXT,
+        source_path TEXT,
+        has_offline_scenarios INTEGER,
+        has_edited INTEGER,
+        share_code TEXT,
+        version TEXT,
+        updated TEXT,
+        is_private INTEGER
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS playlist_scenarios (
+        playlist_id TEXT NOT NULL,
+        scenario_name TEXT NOT NULL,
+        PRIMARY KEY (playlist_id, scenario_name)
+    )
+    """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_scenario_name ON runs (scenario_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_challenge_start ON runs (challenge_start)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_score ON runs (score)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_source_file ON runs (source_file)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_scenario_hash ON runs (scenario_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kill_events_run_id ON kill_events (run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kill_events_scenario_name ON kill_events (scenario_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_playlists_name ON playlists (playlist_name)")
+
+    conn.commit()
 
 
 # =========================
@@ -254,7 +356,6 @@ def parse_kovaaks_stats_file(file_path: Path) -> dict[str, Any]:
     run_id = file_sha256
 
     run_doc = {
-        "_id": run_id,
         "run_id": run_id,
         "scenario_hash": scenario_hash,
         "file_sha256": file_sha256,
@@ -282,11 +383,10 @@ def parse_kovaaks_stats_file(file_path: Path) -> dict[str, Any]:
         "run_datetime": file_timestamp_iso,
         "file_timestamp_str": filename_meta.get("file_timestamp_str"),
         "game_version": clean_string(summary.get("Game Version")),
-        "weapon_summary": weapon_summary,
         "kill_count_parsed": len(kill_events),
-        "raw_summary": summary,
-        "file_metadata": filename_meta,
-        "playlist_names": [],
+        "raw_summary_json": json.dumps(summary),
+        "file_metadata_json": json.dumps(filename_meta),
+        "weapon_summary_json": json.dumps(weapon_summary),
     }
 
     for event in kill_events:
@@ -360,88 +460,143 @@ def parse_playlist_file(file_path: Path) -> dict[str, Any]:
 
 
 # =========================
-# Mongo helpers
+# SQLite write helpers
 # =========================
 
-def get_database(mongo_uri: str = DEFAULT_MONGO_URI, db_name: str = DEFAULT_DB_NAME) -> Database:
-    client = MongoClient(mongo_uri)
-    return client[db_name]
-
-
-def ensure_indexes(db: Database) -> None:
-    db.runs.create_index("scenario_name")
-    db.runs.create_index("challenge_start")
-    db.runs.create_index("score")
-    db.runs.create_index("source_file")
-    db.runs.create_index("file_sha256", unique=True)
-    db.runs.create_index("scenario_hash")
-    db.runs.create_index("playlist_names")
-
-    db.kill_events.create_index("run_id")
-    db.kill_events.create_index([("run_id", 1), ("kill_number", 1)], unique=True)
-    db.kill_events.create_index("scenario_name")
-
-    db.playlists.create_index("playlist_name", unique=True)
-    db.playlists.create_index("scenario_names")
-
-
-def upsert_run_and_events(db: Database, parsed: dict[str, Any]) -> tuple[bool, int]:
-    runs: Collection = db.runs
-    kill_events: Collection = db.kill_events
-
+def upsert_run_and_events(conn: sqlite3.Connection, parsed: dict[str, Any]) -> tuple[bool, int]:
     run_doc = parsed["run"]
     events = parsed["kill_events"]
-    run_id = run_doc["_id"]
+    run_id = run_doc["run_id"]
 
-    existing = runs.find_one({"_id": run_id}, {"_id": 1})
+    existing = conn.execute(
+        "SELECT 1 FROM runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
 
-    runs.update_one({"_id": run_id}, {"$set": run_doc}, upsert=True)
+    conn.execute("""
+        INSERT OR REPLACE INTO runs (
+            run_id, scenario_hash, file_sha256, source_file, source_path,
+            scenario_name, challenge_name, score, kills, deaths, fight_time,
+            time_remaining, avg_ttk, damage_done, hit_count, miss_count,
+            pause_count, pause_duration, avg_target_scale, avg_time_dilation,
+            input_lag, max_fps_config, sens_scale, challenge_start, run_datetime,
+            file_timestamp_str, game_version, kill_count_parsed,
+            raw_summary_json, file_metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        run_doc["run_id"],
+        run_doc["scenario_hash"],
+        run_doc["file_sha256"],
+        run_doc["source_file"],
+        run_doc["source_path"],
+        run_doc["scenario_name"],
+        run_doc["challenge_name"],
+        run_doc["score"],
+        run_doc["kills"],
+        run_doc["deaths"],
+        run_doc["fight_time"],
+        run_doc["time_remaining"],
+        run_doc["avg_ttk"],
+        run_doc["damage_done"],
+        run_doc["hit_count"],
+        run_doc["miss_count"],
+        run_doc["pause_count"],
+        run_doc["pause_duration"],
+        run_doc["avg_target_scale"],
+        run_doc["avg_time_dilation"],
+        run_doc["input_lag"],
+        run_doc["max_fps_config"],
+        run_doc["sens_scale"],
+        run_doc["challenge_start"],
+        run_doc["run_datetime"],
+        run_doc["file_timestamp_str"],
+        run_doc["game_version"],
+        run_doc["kill_count_parsed"],
+        run_doc["raw_summary_json"],
+        run_doc["file_metadata_json"],
+    ))
 
-    kill_events.delete_many({"run_id": run_id})
+    conn.execute("DELETE FROM kill_events WHERE run_id = ?", (run_id,))
 
     if events:
-        ops = [
-            UpdateOne(
-                {"run_id": event["run_id"], "kill_number": event["kill_number"]},
-                {"$set": event},
-                upsert=True,
+        conn.executemany("""
+            INSERT OR REPLACE INTO kill_events (
+                run_id, kill_number, timestamp, bot, weapon, ttk_seconds,
+                shots, hits, accuracy, damage_done, damage_possible,
+                efficiency, cheated, overshots, scenario_name, source_file
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (
+                event["run_id"],
+                event["kill_number"],
+                event["timestamp"],
+                event["bot"],
+                event["weapon"],
+                event["ttk_seconds"],
+                event["shots"],
+                event["hits"],
+                event["accuracy"],
+                event["damage_done"],
+                event["damage_possible"],
+                event["efficiency"],
+                event["cheated"],
+                event["overshots"],
+                event["scenario_name"],
+                event["source_file"],
             )
             for event in events
-        ]
-        kill_events.bulk_write(ops, ordered=False)
+        ])
 
+    conn.commit()
     return existing is None, len(events)
 
 
-def upsert_playlist(db: Database, playlist_doc: dict[str, Any]) -> bool:
-    playlists: Collection = db.playlists
-    existing = playlists.find_one({"_id": playlist_doc["_id"]}, {"_id": 1})
-    playlists.update_one({"_id": playlist_doc["_id"]}, {"$set": playlist_doc}, upsert=True)
-    return existing is None
+def upsert_playlist(conn: sqlite3.Connection, playlist_doc: dict[str, Any]) -> bool:
+    playlist_id = str(playlist_doc["playlist_id"]) if playlist_doc["playlist_id"] is not None else playlist_doc["_id"]
 
+    existing = conn.execute(
+        "SELECT 1 FROM playlists WHERE playlist_id = ?",
+        (playlist_id,),
+    ).fetchone()
 
-def link_runs_to_playlists(db: Database) -> None:
-    """
-    Populate runs.playlist_names based on scenario_name membership in ingested playlists.
-    """
-    playlists = list(db.playlists.find({}, {"playlist_name": 1, "scenario_names": 1}))
-    scenario_to_playlists: dict[str, list[str]] = {}
-
-    for playlist in playlists:
-        playlist_name = playlist.get("playlist_name")
-        for scenario_name in playlist.get("scenario_names", []):
-            scenario_to_playlists.setdefault(scenario_name, []).append(playlist_name)
-
-    for scenario_name, playlist_names in scenario_to_playlists.items():
-        db.runs.update_many(
-            {"scenario_name": scenario_name},
-            {"$set": {"playlist_names": sorted(set(playlist_names))}},
+    conn.execute("""
+        INSERT OR REPLACE INTO playlists (
+            playlist_id, playlist_name, author_steam_id, author_name,
+            description, scenario_count, source_file, source_path,
+            has_offline_scenarios, has_edited, share_code, version,
+            updated, is_private
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        playlist_id,
+        playlist_doc["playlist_name"],
+        playlist_doc["author_steam_id"],
+        playlist_doc["author_name"],
+        playlist_doc["description"],
+        playlist_doc["scenario_count"],
+        playlist_doc["source_file"],
+        playlist_doc["source_path"],
+        playlist_doc["has_offline_scenarios"],
+        playlist_doc["has_edited"],
+        playlist_doc["share_code"],
+        str(playlist_doc["version"]) if playlist_doc["version"] is not None else None,
+        str(playlist_doc["updated"]) if playlist_doc["updated"] is not None else None,
+        playlist_doc["is_private"],
+    ))
 
-    db.runs.update_many(
-        {"scenario_name": {"$nin": list(scenario_to_playlists.keys())}},
-        {"$set": {"playlist_names": []}},
-    )
+    conn.execute("DELETE FROM playlist_scenarios WHERE playlist_id = ?", (playlist_id,))
+
+    scenario_names = playlist_doc.get("scenario_names", [])
+    if scenario_names:
+        conn.executemany("""
+            INSERT OR REPLACE INTO playlist_scenarios (playlist_id, scenario_name)
+            VALUES (?, ?)
+        """, [(playlist_id, s) for s in scenario_names])
+
+    conn.commit()
+    return existing is None
 
 
 # =========================
@@ -449,7 +604,7 @@ def link_runs_to_playlists(db: Database) -> None:
 # =========================
 
 def ingest_stats_folder(
-    db: Database,
+    conn: sqlite3.Connection,
     stats_dir: str | Path = DEFAULT_STATS_DIR,
 ) -> dict[str, Any]:
     stats_path = Path(stats_dir)
@@ -469,7 +624,7 @@ def ingest_stats_folder(
     for file_path in csv_files:
         try:
             parsed = parse_kovaaks_stats_file(file_path)
-            inserted, event_count = upsert_run_and_events(db, parsed)
+            inserted, event_count = upsert_run_and_events(conn, parsed)
 
             results["files_processed"] += 1
             results["kill_events_written"] += event_count
@@ -485,7 +640,7 @@ def ingest_stats_folder(
 
 
 def ingest_playlists_folder(
-    db: Database,
+    conn: sqlite3.Connection,
     playlists_dir: str | Path = DEFAULT_PLAYLISTS_DIR,
 ) -> dict[str, Any]:
     playlists_path = Path(playlists_dir)
@@ -504,7 +659,7 @@ def ingest_playlists_folder(
     for file_path in json_files:
         try:
             playlist_doc = parse_playlist_file(file_path)
-            inserted = upsert_playlist(db, playlist_doc)
+            inserted = upsert_playlist(conn, playlist_doc)
 
             results["files_processed"] += 1
             if inserted:
@@ -521,15 +676,15 @@ def ingest_playlists_folder(
 def ingest_all(
     stats_dir: str | Path = DEFAULT_STATS_DIR,
     playlists_dir: str | Path = DEFAULT_PLAYLISTS_DIR,
-    mongo_uri: str = DEFAULT_MONGO_URI,
-    db_name: str = DEFAULT_DB_NAME,
+    db_path: str = DEFAULT_DB_PATH,
 ) -> dict[str, Any]:
-    db = get_database(mongo_uri=mongo_uri, db_name=db_name)
-    ensure_indexes(db)
+    conn = get_connection(db_path=db_path)
+    ensure_schema(conn)
 
-    stats_summary = ingest_stats_folder(db, stats_dir=stats_dir)
-    playlists_summary = ingest_playlists_folder(db, playlists_dir=playlists_dir)
-    link_runs_to_playlists(db)
+    stats_summary = ingest_stats_folder(conn, stats_dir=stats_dir)
+    playlists_summary = ingest_playlists_folder(conn, playlists_dir=playlists_dir)
+
+    conn.close()
 
     return {
         "stats": stats_summary,
@@ -540,14 +695,12 @@ def ingest_all(
 if __name__ == "__main__":
     stats_dir = os.getenv("KOVAAKS_STATS_DIR", DEFAULT_STATS_DIR)
     playlists_dir = os.getenv("KOVAAKS_PLAYLISTS_DIR", DEFAULT_PLAYLISTS_DIR)
-    mongo_uri = os.getenv("MONGO_URI", DEFAULT_MONGO_URI)
-    db_name = os.getenv("MONGO_DB_NAME", DEFAULT_DB_NAME)
+    db_path = os.getenv("KOVAAKS_DB_PATH", DEFAULT_DB_PATH)
 
     summary = ingest_all(
         stats_dir=stats_dir,
         playlists_dir=playlists_dir,
-        mongo_uri=mongo_uri,
-        db_name=db_name,
+        db_path=db_path,
     )
 
     print("\n=== Stats Summary ===")

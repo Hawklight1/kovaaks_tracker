@@ -1,31 +1,28 @@
 from __future__ import annotations
 
 import altair as alt
+import json
 import pandas as pd
+import sqlite3
 import streamlit as st
-from pymongo import MongoClient
 
 
-DEFAULT_MONGO_URI = "mongodb://localhost:27017/"
-DEFAULT_DB_NAME = "kovaaks_tracker"
-DEFAULT_RUNS_COLLECTION = "runs"
-DEFAULT_KILL_EVENTS_COLLECTION = "kill_events"
-DEFAULT_PLAYLISTS_COLLECTION = "playlists"
+DEFAULT_DB_PATH = "kovaaks_tracker.db"
 
 
 @st.cache_resource
-def get_client(mongo_uri: str) -> MongoClient:
-    return MongoClient(mongo_uri)
+def get_conn(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return conn
 
 
 @st.cache_data(ttl=30)
-def load_runs_df(mongo_uri: str, db_name: str, collection_name: str) -> pd.DataFrame:
-    client = get_client(mongo_uri)
-    docs = list(client[db_name][collection_name].find({}, {"raw_summary": 0}))
-    if not docs:
-        return pd.DataFrame()
+def load_runs_df(db_path: str) -> pd.DataFrame:
+    conn = get_conn(db_path)
+    df = pd.read_sql("SELECT * FROM runs", conn)
 
-    df = pd.DataFrame(docs)
+    if df.empty:
+        return pd.DataFrame()
 
     if "scenario_name" in df.columns:
         df["scenario_name"] = (
@@ -89,10 +86,17 @@ def load_runs_df(mongo_uri: str, db_name: str, collection_name: str) -> pd.DataF
     if "scenario_hash" not in df.columns:
         df["scenario_hash"] = None
 
-    if "file_metadata" in df.columns:
-        df["filename_group"] = df["file_metadata"].apply(
-            lambda x: x.get("challenge_name_from_file") if isinstance(x, dict) else None
-        )
+    if "file_metadata_json" in df.columns:
+        def extract_filename_group(x):
+            if not x:
+                return None
+            try:
+                payload = json.loads(x)
+                return payload.get("challenge_name_from_file")
+            except Exception:
+                return None
+
+        df["filename_group"] = df["file_metadata_json"].apply(extract_filename_group)
     else:
         df["filename_group"] = None
 
@@ -101,20 +105,20 @@ def load_runs_df(mongo_uri: str, db_name: str, collection_name: str) -> pd.DataF
 
 @st.cache_data(ttl=30)
 def load_kill_events_df(
-    mongo_uri: str,
-    db_name: str,
-    collection_name: str,
+    db_path: str,
     run_ids: list[str],
 ) -> pd.DataFrame:
     if not run_ids:
         return pd.DataFrame()
 
-    client = get_client(mongo_uri)
-    docs = list(client[db_name][collection_name].find({"run_id": {"$in": run_ids}}, {"_id": 0}))
-    if not docs:
+    conn = get_conn(db_path)
+    placeholders = ",".join(["?"] * len(run_ids))
+    query = f"SELECT * FROM kill_events WHERE run_id IN ({placeholders})"
+    df = pd.read_sql(query, conn, params=run_ids)
+
+    if df.empty:
         return pd.DataFrame()
 
-    df = pd.DataFrame(docs)
     numeric_cols = [
         "kill_number",
         "ttk_seconds",
@@ -134,26 +138,24 @@ def load_kill_events_df(
 
 
 @st.cache_data(ttl=30)
-def load_playlists_df(mongo_uri: str, db_name: str, collection_name: str) -> pd.DataFrame:
-    client = get_client(mongo_uri)
-    docs = list(
-        client[db_name][collection_name].find(
-            {},
-            {
-                "_id": 1,
-                "playlist_name": 1,
-                "scenario_names": 1,
-                "scenario_count": 1,
-                "source_file": 1,
-                "updated": 1,
-                "author_name": 1,
-            },
-        )
-    )
-    if not docs:
+def load_playlists_df(db_path: str) -> pd.DataFrame:
+    conn = get_conn(db_path)
+
+    playlists_df = pd.read_sql("""
+        SELECT
+            playlist_id,
+            playlist_name,
+            source_file,
+            updated,
+            author_name,
+            scenario_count
+        FROM playlists
+    """, conn)
+
+    if playlists_df.empty:
         return pd.DataFrame(
             columns=[
-                "_id",
+                "playlist_id",
                 "playlist_name",
                 "scenario_names",
                 "scenario_count",
@@ -163,16 +165,25 @@ def load_playlists_df(mongo_uri: str, db_name: str, collection_name: str) -> pd.
             ]
         )
 
-    df = pd.DataFrame(docs)
-    if "playlist_name" not in df.columns:
-        df["playlist_name"] = "Unnamed Playlist"
-    if "scenario_names" not in df.columns:
-        df["scenario_names"] = [[] for _ in range(len(df))]
-    if "scenario_count" not in df.columns:
-        df["scenario_count"] = df["scenario_names"].apply(
-            lambda x: len(x) if isinstance(x, list) else 0
-        )
-    return df
+    scenario_df = pd.read_sql("""
+        SELECT playlist_id, scenario_name
+        FROM playlist_scenarios
+        ORDER BY rowid
+    """, conn)
+
+    scenario_lookup = (
+        scenario_df.groupby("playlist_id")["scenario_name"]
+        .apply(list)
+        .to_dict()
+        if not scenario_df.empty
+        else {}
+    )
+
+    playlists_df["scenario_names"] = playlists_df["playlist_id"].map(
+        lambda x: scenario_lookup.get(x, [])
+    )
+
+    return playlists_df
 
 
 def build_custom_group_lookup(text_blob: str) -> dict[str, str]:
@@ -240,6 +251,7 @@ def build_playlist_lookup(playlists_df: pd.DataFrame) -> dict[str, set[str]]:
 
     return playlist_lookup
 
+
 def build_playlist_order_lookup(playlists_df: pd.DataFrame) -> dict[str, list[str]]:
     playlist_order_lookup: dict[str, list[str]] = {}
 
@@ -265,6 +277,7 @@ def build_playlist_order_lookup(playlists_df: pd.DataFrame) -> dict[str, list[st
 
     return playlist_order_lookup
 
+
 def summarize_tasks(
     df: pd.DataFrame,
     scenario_order: list[str] | None = None,
@@ -272,7 +285,7 @@ def summarize_tasks(
     grouped = (
         df.groupby("scenario_name", dropna=False)
         .agg(
-            runs=("_id", "count"),
+            runs=("run_id", "count"),
             best_score=("score", "max"),
             latest_run=("challenge_start_dt", "max"),
         )
@@ -292,31 +305,43 @@ def summarize_tasks(
 
 def render_performance_chart(task_df: pd.DataFrame, metric_col: str = "score") -> None:
     chart_df = task_df.copy()
-    chart_df = chart_df.dropna(subset=["challenge_start_dt", metric_col]).sort_values("challenge_start_dt")
+    chart_df = chart_df.dropna(subset=[metric_col]).copy()
 
     if chart_df.empty:
-        st.info("No dated performance data available for that scenario.")
+        st.info("No performance data available for that scenario.")
         return
 
-    chart_df["run_date"] = pd.to_datetime(chart_df["challenge_start_dt"])
+    if "challenge_start_dt" in chart_df.columns and chart_df["challenge_start_dt"].notna().any():
+        chart_df = chart_df.sort_values("challenge_start_dt")
+    elif "challenge_start" in chart_df.columns:
+        chart_df = chart_df.sort_values("challenge_start")
+    else:
+        chart_df = chart_df.reset_index(drop=True)
+
+    chart_df = chart_df.reset_index(drop=True)
+    chart_df["run_number"] = chart_df.index + 1
 
     chart = (
         alt.Chart(chart_df)
         .mark_line(point=True)
         .encode(
             x=alt.X(
-                "run_date:T",
-                title="Run Date",
-                axis=alt.Axis(format="%Y-%m-%d", labelAngle=-35),
+                "run_number:Q",
+                title="Run Number",
+                axis=alt.Axis(tickMinStep=1),
             ),
-            y=alt.Y(f"{metric_col}:Q", title=metric_col.replace("_", " ").title()),
+            y=alt.Y(
+                f"{metric_col}:Q",
+                title=metric_col.replace("_", " ").title(),
+            ),
             tooltip=[
+                alt.Tooltip("run_number:Q", title="Run #"),
                 alt.Tooltip("scenario_name:N", title="Scenario"),
-                alt.Tooltip("run_date:T", title="Run Time"),
                 alt.Tooltip(f"{metric_col}:Q", title=metric_col.replace("_", " ").title(), format=".2f"),
                 alt.Tooltip("score:Q", title="Score", format=".2f"),
                 alt.Tooltip("accuracy_pct:Q", title="Accuracy %", format=".1f"),
                 alt.Tooltip("avg_ttk:Q", title="Avg TTK", format=".3f"),
+                alt.Tooltip("challenge_start:N", title="Challenge Start"),
                 alt.Tooltip("source_file:N", title="Source File"),
             ],
         )
@@ -332,12 +357,8 @@ st.title("Kovaak's Task Dashboard")
 st.caption("Browse tasks by group, inspect one scenario at a time, and review run history.")
 
 with st.sidebar:
-    st.header("Connection")
-    mongo_uri = st.text_input("Mongo URI", value=DEFAULT_MONGO_URI)
-    db_name = st.text_input("Database", value=DEFAULT_DB_NAME)
-    runs_collection = st.text_input("Runs collection", value=DEFAULT_RUNS_COLLECTION)
-    kill_events_collection = st.text_input("Kill events collection", value=DEFAULT_KILL_EVENTS_COLLECTION)
-    playlists_collection = st.text_input("Playlists collection", value=DEFAULT_PLAYLISTS_COLLECTION)
+    st.header("Database")
+    db_path = st.text_input("SQLite DB Path", value=DEFAULT_DB_PATH)
     refresh = st.button("Refresh data")
 
 if refresh:
@@ -346,19 +367,18 @@ if refresh:
     load_playlists_df.clear()
 
 try:
-    runs_df = load_runs_df(mongo_uri, db_name, runs_collection)
+    runs_df = load_runs_df(db_path)
 except Exception as e:
-    st.error(f"Could not load data from MongoDB: {e}")
+    st.error(f"Could not load data from SQLite: {e}")
     st.stop()
 
 if runs_df.empty:
     st.warning("No run data found yet. Run the ingester first.")
     st.stop()
 
-playlists_df = load_playlists_df(mongo_uri, db_name, playlists_collection)
+playlists_df = load_playlists_df(db_path)
 playlist_lookup = build_playlist_lookup(playlists_df)
 playlist_order_lookup = build_playlist_order_lookup(playlists_df)
-playlist_options = sorted(playlist_lookup.keys())
 
 with st.sidebar:
     st.header("View Settings")
@@ -372,9 +392,9 @@ with st.sidebar:
     custom_group_text = st.text_area(
         "Custom groups",
         value=(
-        "Tracking:\n"
-        "Kindaclose Long Strafes\n"
-        "Kindaclose Fast Strafes Thin\n"
+            "Tracking:\n"
+            "Kindaclose Long Strafes\n"
+            "Kindaclose Fast Strafes Thin\n"
         ),
         height=180
     )
@@ -394,7 +414,7 @@ if browse_mode == "Playlist":
     playlist_choices = sorted(playlist_lookup.keys())
 
     if not playlist_choices:
-        st.warning("No saved playlists were found in the playlists collection.")
+        st.warning("No saved playlists were found in the playlists table.")
         st.stop()
 
     selected_playlist = st.selectbox("Playlist", options=playlist_choices)
@@ -472,7 +492,7 @@ metric_choice = st.selectbox(
 render_performance_chart(task_df, metric_col=metric_choice)
 
 st.subheader("Run Inspector")
-run_picker_df = task_df[["_id", "scenario_name", "source_file", "challenge_start", "score"]].copy()
+run_picker_df = task_df[["run_id", "scenario_name", "source_file", "challenge_start", "score"]].copy()
 run_picker_df["label"] = run_picker_df.apply(
     lambda row: f"{row['scenario_name']} | {row.get('challenge_start', 'Unknown Time')} | score={row.get('score', 'N/A')}",
     axis=1,
@@ -482,13 +502,13 @@ if run_picker_df.empty:
     st.info("No runs available for the selected scenario.")
 else:
     selected_run_label = st.selectbox("Choose a run", options=run_picker_df["label"].tolist())
-    selected_run_id = run_picker_df.loc[run_picker_df["label"] == selected_run_label, "_id"].iloc[0]
-    selected_run = task_df[task_df["_id"] == selected_run_id].iloc[0].to_dict()
+    selected_run_id = run_picker_df.loc[run_picker_df["label"] == selected_run_label, "run_id"].iloc[0]
+    selected_run = task_df[task_df["run_id"] == selected_run_id].iloc[0].to_dict()
 
     with st.expander("Run document"):
         st.json(selected_run)
 
-    kill_df = load_kill_events_df(mongo_uri, db_name, kill_events_collection, [selected_run_id])
+    kill_df = load_kill_events_df(db_path, [selected_run_id])
     if kill_df.empty:
         st.info("No kill events found for this run.")
     else:
@@ -534,7 +554,7 @@ history_cols = [
         "accuracy_pct",
         "avg_ttk",
         "source_file",
-        "_id",
+        "run_id",
     ]
     if col in history_df.columns
 ]
