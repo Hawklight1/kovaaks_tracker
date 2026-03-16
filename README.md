@@ -11,7 +11,7 @@ A locally run stat tracker that pulls your full Kovaak's scenario history and di
   Saved Kovaak's playlists are parsed and used to group scenarios in the dashboard.
 
 - **Performance Trend Visualization**  
-  Interactive charts show score, accuracy, kills, and other metrics over time.
+  Interactive charts show score, accuracy, kills, and other metrics across sequential runs..
 
 - **Scenario-Level Analysis**  
   View total runs, best score, and most recent run for each task.
@@ -39,34 +39,42 @@ stat_ingestion.py
 and playlists)
 │
 ▼
-MongoDB
-kovaaks_tracker
+SQLite Database
+kovaaks_tracker.db
 ├── runs
 ├── kill_events
-└── playlists
+├── playlists
+└── playlist_scenarios
 │
 ▼
 Streamlit Dashboard
 dashboard.py
 ```
-The ingestion script parses Kovaak's run summary files and playlist definitions and stores the results in MongoDB.  The Streamlit dashboard queries this database to provide interactive visualizations, scenario summaries, and run inspection tools.
+The ingestion script parses Kovaak's run summary files and playlist definitions and stores the parsed results in a local SQLite database (kovaaks_tracker.db).  The Streamlit dashboard queries this database to provide interactive visualizations, scenario summaries, and run inspection tools.
 
 ### System Requirements
-**Python 3.10+** for data ingestion and Streamlit dashboard
+**Python 3.10+**
 
-**MongoDB** for data storage (see: [MongoDB install](https://www.mongodb.com/docs/manual/installation/?msockid=35c8347aa17266352649258aa0576720) to install MongoDB)
+**Python packages**
+- Streamlit
+- Pandas
+- Altair
 
-**Streamlit** for building dashboard interface
+Install dependencies with:
+
+`pip install -r requirements.txt`
 
 **Kovaak's save files** for accessing scenario data, typically found at:
 
 `C:\Program Files (x86)\Steam\steamapps\common\FPSAimTrainer\FPSAimTrainer`
 
+No external database is required — the project uses a local SQLite database automatically created during ingestion.
+
 ### To run
 1. Copy the repo using standard methods like `git clone https://github.com/Hawklight1/kovaaks_tracker`
 2. Set up a virtual environment, preferably via pip with `python -m venv .venv `
 3. Install requirements with `pip install -r requirements.txt`
-4. Ingest kovaak's stats to a local MongoDB with `python stat_ingestion.py`
+4. Ingest Kovaak's stats into the local SQLite database with `python stat_ingestion.py` (This creates a local database file: `kovaaks_tracker.db`)
 5. Load dashboard with `streamlit run dashboard.py`
 
 ### Dashboard Preview
