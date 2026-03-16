@@ -321,33 +321,44 @@ def render_performance_chart(task_df: pd.DataFrame, metric_col: str = "score") -
     chart_df = chart_df.reset_index(drop=True)
     chart_df["run_number"] = chart_df.index + 1
 
-    chart = (
-        alt.Chart(chart_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X(
-                "run_number:Q",
-                title="Run Number",
-                axis=alt.Axis(tickMinStep=1),
-            ),
-            y=alt.Y(
-                f"{metric_col}:Q",
-                title=metric_col.replace("_", " ").title(),
-            ),
-            tooltip=[
-                alt.Tooltip("run_number:Q", title="Run #"),
-                alt.Tooltip("scenario_name:N", title="Scenario"),
-                alt.Tooltip(f"{metric_col}:Q", title=metric_col.replace("_", " ").title(), format=".2f"),
-                alt.Tooltip("score:Q", title="Score", format=".2f"),
-                alt.Tooltip("accuracy_pct:Q", title="Accuracy %", format=".1f"),
-                alt.Tooltip("avg_ttk:Q", title="Avg TTK", format=".3f"),
-                alt.Tooltip("challenge_start:N", title="Challenge Start"),
-                alt.Tooltip("source_file:N", title="Source File"),
-            ],
+    base = alt.Chart(chart_df).encode(
+        x=alt.X(
+            "run_number:Q",
+            title="Run Number",
+            axis=alt.Axis(tickMinStep=1),
+        ),
+        y=alt.Y(
+            f"{metric_col}:Q",
+            title=metric_col.replace("_", " ").title(),
         )
-        .properties(height=400)
-        .interactive()
     )
+
+    # actual run scores
+    points = base.mark_line(point=True)
+
+    # regression trendline
+    trendline = (
+        base.transform_regression(
+            "run_number",
+            metric_col,
+            method="linear"
+        )
+        .mark_line(
+            color="Orange",
+            strokeDash=[6,4],
+            size=3
+        )
+    )
+
+    chart = (points + trendline).encode(
+        tooltip=[
+            alt.Tooltip("run_number:Q", title="Run #"),
+            alt.Tooltip(f"{metric_col}:Q", title="Score", format=".2f"),
+            alt.Tooltip("accuracy_pct:Q", title="Accuracy %", format=".1f"),
+            alt.Tooltip("avg_ttk:Q", title="Avg TTK", format=".3f"),
+            alt.Tooltip("challenge_start:N", title="Challenge Start"),
+        ]
+    ).properties(height=400)
 
     st.altair_chart(chart, use_container_width=True)
 
